@@ -1,0 +1,49 @@
+Richard Paasch
+Term 3 - Project 1 - Path Planning
+
+This project was completed with aid of the provided starter code and project walkthrough.
+
+The walkthrough allowed us understanding of basic control of the car and how it would start accelerating, decelerate once an object was detected in front of it as well as change a lane. Using these fundamentals, it came down to designing a state machine (an elaborate if-then statement) to acheive the completion of this project.
+
+Modifying the project walkthrough code, I added three additional variables. stepcount, FOREWARD_LOOKING and BACKWARD_LOOKING.
+
+FOREWARD_LOOKING and BACKWARD_LOOKING are constant values later needed to "adjust" the "scan range" of the sensors. In the project walkthrough, this was set to 30, but I later found it insufficient since we might want to see 1.5x up to 2x further so we wouldn't "trap" ourselves after a lane change.
+
+stepcount, I added so that my state machine would not make too many lane changes. I set this to 1 second (50 steps) so the car had time to assess its surroundings.
+
+State Machine Design
+
+Borrowing the project walkthrough's code, I created two additional "lane detection" lanes to see the car's RELATIVE LEFT and RELATIVE RIGHT. For example, if the car is in the RIGHT lane, the CENTER lane is it's "left" and the SHOULDER is its "right" (I added a flag to my code to detect an "obstruction" if it was in the left or rightmost lanes to avoid the state machine from deciding on changing to those lanes!)
+
+Each lane of code would collect all the "ids" the sensor_fusion 2D array returned for their respective "car lanes" and would only count the objects in the FOREWARD and BACKWARD_LOOKING range (which I set to +40 and -10.)
+
+The state machine logic was as follows:
+
+- if an object was detected in your lane:
+  - if an object was NOT in the left lane 
+    AND you aren't in the leftmost lane 
+    AND you haven't executed a lane change lately (1 second)
+    - then go left
+  - if an object was NOT in the right lane
+    AND you aren't in the rightmost lane
+    AND you haven't executed a lane change lately (1 second)
+    - then go right
+  - if an object IS in BOTH lanes
+    AND your relative speed is MORE THAN the speed of the object in front of you
+    - decelerate
+- ELSE accelerate if no object in your lane
+
+Weaknesses in my Design
+
+- My detection range is +45/-15. If a vehicle was over the speed limit and trying to pass me from 
+behind, -15 might be insufficient. Therefore a more elaborate state machine could have fixed this
+
+- When all three lanes are blocked, decelerating and then accelerating back to speed was almost oscillatory. Maybe a PID implementation could have been useful here.
+
+Strengths in my Design
+
+- I haven't hit anything for hundreds of miles? :)
+
+
+
+

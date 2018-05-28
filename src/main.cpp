@@ -5,9 +5,11 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <string>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -38,6 +40,7 @@ double distance(double x1, double y1, double x2, double y2)
 {
 	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
 }
+
 int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
 {
 
@@ -174,7 +177,7 @@ int main() {
   vector<double> map_waypoints_dy;
 
   // Waypoint map to read from
-  string map_file_ = "../data/highway_map.csv";
+  string map_file_ = "./data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
   double max_s = 6945.554;
 
@@ -200,7 +203,26 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  int lane = 1;
+  double ref_vel = 0.0;
+  int stepcount = 0;
+
+  const double TARGET_SPEED = 48.5;
+  const double FOREWARD_LOOKING = 40.0;
+  const double BACKWARD_LOOKING = 10.0;
+  const int MAX_STEP = 50;
+
+  h.onMessage([&ref_vel,
+               &map_waypoints_x,
+               &map_waypoints_y,
+               &map_waypoints_s,
+               &map_waypoints_dx,
+               &map_waypoints_dy,
+               &lane,
+               &stepcount,
+               &TARGET_SPEED,
+               &FOREWARD_LOOKING,
+               &BACKWARD_LOOKING](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -237,13 +259,242 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	json msgJson;
-
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
-
-
           	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+          	int prev_size = previous_path_x.size();
+
+          	if (prev_size > 0) car_s = end_path_s;
+
+          	// BEGIN STATE MACHINE
+
+          	bool obj_detectd_L = false; // any objects in the left lane?
+          	bool obj_detectd_R = false; // any objects in the right lane?
+          	bool obj_detectd_C = false; // any objects in front of you?
+
+          	double match_speed;
+
+          	vector<double> dist_obj_L, dist_obj_R, dist_obj_C; // for debugging
+
+
+          	// loop thru all sensor objects detected
+          	// sensor fusion (0-6), id, x, y, vx, vy, s, d
+          	for (int i = 0; i < sensor_fusion.size(); i++)
+          	{
+          	  float d = sensor_fusion[i][6];
+
+              if (d < (2 + 4 * lane - 2) && d > (2 + 4 * lane - 6)) // get lane left of current objects
+              {
+                double vx_L = sensor_fusion[i][3];
+                double vy_L = sensor_fusion[i][4];
+                double v_L = sqrt(pow(vx_L, 2) + pow(vy_L, 2));
+                double s_L = sensor_fusion[i][5];
+
+                s_L += ((double)prev_size * 0.02 * v_L);
+
+                double passing = s_L-car_s;
+
+                if(passing <= FOREWARD_LOOKING && passing >= -BACKWARD_LOOKING)
+                {
+                  dist_obj_L.push_back(passing); // for debugging
+                  obj_detectd_L = true;
+                }
+              }
+
+          	  if (d < (2 + 4 * lane + 2) && d > (2 + 4 * lane - 2)) // get current lane objects
+          	  {
+          	    double vx_C = sensor_fusion[i][3];
+          	    double vy_C = sensor_fusion[i][4];
+          	    double v_C = sqrt(pow(vx_C, 2) + pow(vy_C, 2));
+          	    double s_C = sensor_fusion[i][5];
+
+          	    s_C += ((double)prev_size * 0.02 * v_C);
+
+          	    double passing = s_C-car_s;
+
+                if((s_C > car_s) && (passing < FOREWARD_LOOKING / 2))
+                {
+                  dist_obj_C.push_back(passing); // for debugging
+                  obj_detectd_C = true;
+                  match_speed = v_C;
+                }
+          	  }
+
+          	  if (d < (2 + 4 * lane + 6) && d > (2 + 4 * lane + 2)) // get lane right of current objects
+          	  {
+                double vx_R = sensor_fusion[i][3];
+                double vy_R = sensor_fusion[i][4];
+                double v_R = sqrt(pow(vx_R, 2) + pow(vy_R, 2));
+                double s_R = sensor_fusion[i][5];
+
+                s_R += ((double)prev_size * 0.02 * v_R);
+
+                double passing = s_R-car_s;
+
+                if(passing <= FOREWARD_LOOKING && passing >= -BACKWARD_LOOKING)
+                {
+                  dist_obj_R.push_back(passing); // for debugging
+                  obj_detectd_R = true;
+                }
+          	  }
+          	} // end for loop (sensor fusion)
+
+            // state machine logic
+
+          	// "left" and "right" is relative to the car so we will enable these flags since it would default to false since
+          	// my sensor logic is designed to detect adjacent lanes and lane = -1 and 3 are not valid lanes
+          	if (lane == 0) {obj_detectd_L = true;}
+          	if (lane == 2) {obj_detectd_R = true;}
+
+            if (obj_detectd_C)
+            {
+              if (!obj_detectd_L && lane != 0 && stepcount > MAX_STEP)
+              {
+                lane--;
+                stepcount = 0; // reset stepcount
+              }
+              else if (!obj_detectd_R && lane != 2 && stepcount > MAX_STEP)
+              {
+                lane++;
+                stepcount = 0; // reset stepcount
+              }
+              else if (obj_detectd_L && obj_detectd_R && (ref_vel > match_speed))
+              {
+                  ref_vel -= 0.224 * 2;
+              }
+            }
+            else if (ref_vel < TARGET_SPEED && obj_detectd_C == false)
+            {
+              ref_vel += 0.224 * 2;
+            }
+
+            stepcount++; // resets at MAX_STEP when a lane change is executed and prohibits any more changes so the car doesn't "bee-line" across lanes
+
+            // MAX_STEP = 50 is about 1 seconds (0.2 second/step)
+
+
+            // DEBUGGING
+            cout << "step: " << stepcount << " obj: L/C/R: " << obj_detectd_L << "/" << obj_detectd_C << "/" << obj_detectd_R;
+
+            cout << " pos: L: ";
+            for (auto l: dist_obj_L)
+            {
+               cout << l << " ";
+            }
+            cout << " C: ";
+            for (auto c: dist_obj_C)
+            {
+              cout << c << " ";
+            }
+            cout << " R: ";
+            for (auto r: dist_obj_R)
+            {
+              cout << r << " ";
+            }
+            cout << endl;
+            // END DEBUGGING
+
+            // END STATE MACHINE
+          	            
+          	vector<double> ptsx, ptsy;
+
+          	double ref_x = car_x;
+          	double ref_y = car_y;
+          	double ref_yaw = deg2rad(car_yaw);
+
+          	if (prev_size < 2)
+          	{
+          	  double prev_car_x = car_x - cos(car_yaw);
+          	  double prev_car_y = car_y - sin(car_yaw);
+
+          	  ptsx.push_back(prev_car_x);
+          	  ptsx.push_back(car_x);
+
+          	  ptsy.push_back(prev_car_y);
+          	  ptsy.push_back(car_y);
+
+          	}
+          	else
+          	{
+          	  ref_x = previous_path_x[prev_size - 1];
+          	  ref_y = previous_path_y[prev_size - 1];
+
+          	  double ref_x_prev = previous_path_x[prev_size - 2];
+          	  double ref_y_prev = previous_path_y[prev_size - 2];
+          	  ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+
+          	  ptsx.push_back(ref_x_prev);
+          	  ptsx.push_back(ref_x);
+
+          	  ptsy.push_back(ref_y_prev);
+          	  ptsy.push_back(ref_y);
+
+          	}
+
+          	vector<double> next_wp0 = getXY(car_s+30, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          	vector<double> next_wp1 = getXY(car_s+60, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+          	vector<double> next_wp2 = getXY(car_s+90, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+          	ptsx.push_back(next_wp0[0]);
+          	ptsx.push_back(next_wp1[0]);
+          	ptsx.push_back(next_wp2[0]);
+
+          	ptsy.push_back(next_wp0[1]);
+          	ptsy.push_back(next_wp1[1]);
+          	ptsy.push_back(next_wp2[1]);
+
+          	for (int i = 0; i < ptsx.size(); i++)
+          	{
+          	  double shift_x = ptsx[i] - ref_x;
+          	  double shift_y = ptsy[i] - ref_y;
+
+          	  ptsx[i] = (shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw));
+          	  ptsy[i] = (shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw));
+
+          	}
+
+          	tk::spline s;
+
+          	s.set_points(ptsx, ptsy);
+
+            vector<double> next_x_vals;
+            vector<double> next_y_vals;
+
+          	for (int i = 0; i < previous_path_x.size(); i++)
+          	{
+          	  next_x_vals.push_back(previous_path_x[i]);
+          	  next_y_vals.push_back(previous_path_y[i]);
+          	}
+
+          	double target_x = 30.0;
+          	double target_y = s(target_x);
+          	double target_dist = sqrt(pow(target_x, 2) + pow(target_y, 2));
+          	double x_add_on = 0;
+
+          	for (int i = 1; i <= 50 - previous_path_x.size(); i++)
+          	{
+
+          	  double N = target_dist / (0.02 * ref_vel / 2.24);
+          	  double x_point = x_add_on + target_x / N;
+          	  double y_point = s(x_point);
+
+          	  x_add_on = x_point;
+
+          	  double x_ref = x_point;
+          	  double y_ref = y_point;
+
+          	  x_point = x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw);
+          	  y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
+
+          	  x_point += ref_x;
+          	  y_point += ref_y;
+
+          	  next_x_vals.push_back(x_point);
+          	  next_y_vals.push_back(y_point);
+
+          	}
+
+          	// END TODO
+
+            json msgJson;
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
